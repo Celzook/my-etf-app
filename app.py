@@ -5,11 +5,12 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
+import concurrent.futures # 병렬 처리를 위한 라이브러리
 
 # -----------------------------------------------------------
 # 1. 페이지 설정
 # -----------------------------------------------------------
-st.set_page_config(layout="wide", page_title="ETF Pro Dashboard")
+st.set_page_config(layout="wide", page_title="ETF Pro : Speed Up")
 
 st.markdown("""
 <style>
@@ -20,7 +21,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # -----------------------------------------------------------
-# 2. 데이터 수집 및 전처리
+# 2. 데이터 수집 및 전처리 (리스트 가져오기)
 # -----------------------------------------------------------
 @st.cache_data(ttl=3600)
 def get_etf_list():
@@ -37,49 +38,96 @@ def get_etf_list():
             
             df_filtered = df_etf[cond_won | cond_ukwon]
             
+            # 너무 적으면 상위 100개 (병렬처리 믿고 개수 늘림)
             if len(df_filtered) < 10:
-                return df_etf.head(70)['Symbol'].tolist()
+                return df_etf.head(100)['Symbol'].tolist()
             return df_filtered['Symbol'].tolist()
         else:
-            return df_etf['Symbol'].head(70).tolist()
+            return df_etf['Symbol'].head(100).tolist()
     except:
         return ['069500', '102110']
 
-def calculate_indicators(df):
-    if len(df) < 20: return df
-    
-    # 이평선
-    df['MA5'] = df['Close'].rolling(window=5).mean()
-    df['MA20'] = df['Close'].rolling(window=20).mean()
-    
-    # 이평선 이격도
-    df['MA_Gap'] = ((df['MA5'] - df['MA20']) / df['MA20']) * 100
-    
-    # 볼린저밴드
-    df['BB_Mid'] = df['MA20']
-    df['BB_Std'] = df['Close'].rolling(window=20).std()
-    df['BB_Upper'] = df['BB_Mid'] + (2 * df['BB_Std'])
-    df['BB_Lower'] = df['BB_Mid'] - (2 * df['BB_Std'])
-    
-    # %B
-    df['PctB'] = (df['Close'] - df['BB_Lower']) / (df['BB_Upper'] - df['BB_Lower'])
-    
-    # RSI
-    delta = df['Close'].diff(1)
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
-    
-    return df
+# -----------------------------------------------------------
+# 3. [핵심] 개별 종목 분석 함수 (병렬 처리를 위해 분리)
+# -----------------------------------------------------------
+def process_single_ticker(ticker, name_map, start_date):
+    """
+    한 종목의 데이터를 가져와 지표를 계산하고 결과를 반환하는 함수
+    """
+    try:
+        # 데이터 수집
+        df = fdr.DataReader(ticker, start_date)
+        df.index = pd.to_datetime(df.index) # 날짜 인덱스 보정
+        
+        if len(df) < 60: return None
+        
+        # --- 지표 계산 (Pandas 벡터화 연산) ---
+        # 이평선
+        df['MA5'] = df['Close'].rolling(window=5).mean()
+        df['MA20'] = df['Close'].rolling(window=20).mean()
+        
+        # 볼린저밴드
+        df['BB_Mid'] = df['MA20']
+        std = df['Close'].rolling(window=20).std()
+        df['BB_Upper'] = df['BB_Mid'] + (2 * std)
+        df['BB_Lower'] = df['BB_Mid'] - (2 * std)
+        
+        # RSI
+        delta = df['Close'].diff(1)
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        df['RSI'] = 100 - (100 / (1 + rs))
+        
+        # %B (볼린저 위치) 및 이격도
+        df['PctB'] = (df['Close'] - df['BB_Lower']) / (df['BB_Upper'] - df['BB_Lower'])
+        df['MA_Gap'] = ((df['MA5'] - df['MA20']) / df['MA20']) * 100
+        
+        # --- 최신 데이터 추출 ---
+        curr = df.iloc[-1]
+        prev = df.iloc[-2]
+        name = name_map.get(ticker, ticker)
+        
+        # Signals
+        ma_sig_text = ""
+        if prev['MA5'] <= prev['MA20'] and curr['MA5'] > curr['MA20']: ma_sig_text = "✅ Golden Cross"
+        elif prev['MA5'] >= prev['MA20'] and curr['MA5'] < curr['MA20']: ma_sig_text = "✅ Dead Cross"
+        elif curr['MA5'] > curr['MA20']: ma_sig_text = "Golden Zone"
+        elif curr['MA5'] < curr['MA20']: ma_sig_text = "Dead Zone"
+        
+        rsi_val = curr['RSI']
+        rsi_sig_text = ""
+        if rsi_val >= 60: rsi_sig_text = "✅ Overbought"
+        elif rsi_val <= 40: rsi_sig_text = "✅ Oversold"
+        
+        bb_pct = curr['PctB']
+        bb_sig_text = ""
+        if bb_pct >= 0.95: bb_sig_text = "✅ Near Upper"
+        elif bb_pct <= 0.05: bb_sig_text = "✅ Near Lower"
 
-def analyze_data(ticker_list):
+        return {
+            'Ticker': ticker,
+            'Name': name,
+            'Close': curr['Close'],
+            'MA_Signal': ma_sig_text,
+            'MA_Gap': round(curr['MA_Gap'], 2),
+            'RSI_Signal': rsi_sig_text,
+            'RSI_Value': round(rsi_val, 2),
+            'BB_Signal': bb_sig_text,
+            'BB_PctB': round(bb_pct, 2),
+            'Data': df # 전체 데이터 (차트용)
+        }
+    except:
+        return None
+
+def analyze_data_parallel(ticker_list):
+    """
+    ThreadPoolExecutor를 사용해 병렬로 데이터 수집 및 분석
+    """
     results = []
-    status_text = st.empty()
-    progress_bar = st.progress(0)
-    total = len(ticker_list)
     
-    start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+    # 분석 기간: 속도를 위해 최근 200일로 최적화 (이평선/차트 그리기에 충분)
+    start_date = (datetime.now() - timedelta(days=200)).strftime('%Y-%m-%d')
     
     try:
         etf_meta = fdr.StockListing('ETF/KR')
@@ -87,84 +135,51 @@ def analyze_data(ticker_list):
     except:
         name_map = {}
 
-    for i, ticker in enumerate(ticker_list):
-        if i % 10 == 0:
-            progress_bar.progress((i + 1) / total)
-            status_text.text(f"데이터 분석 중... {i+1}/{total} ({ticker})")
+    status_text = st.empty()
+    progress_bar = st.progress(0)
+    total = len(ticker_list)
+    
+    # [핵심] 병렬 처리 실행
+    # max_workers=20 : 동시에 20개씩 요청 (속도 대폭 향상)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        # 작업을 스케줄링하고 future 객체들을 리스트로 받음
+        futures = {executor.submit(process_single_ticker, t, name_map, start_date): t for t in ticker_list}
+        
+        completed_count = 0
+        for future in concurrent.futures.as_completed(futures):
+            res = future.result()
+            if res is not None:
+                results.append(res)
+            
+            completed_count += 1
+            # 진행률 표시 (너무 자주 업데이트하면 UI 느려지므로 5개마다)
+            if completed_count % 5 == 0 or completed_count == total:
+                progress_bar.progress(completed_count / total)
+                status_text.text(f"🚀 초고속 분석 중... {completed_count}/{total}")
 
-        try:
-            df = fdr.DataReader(ticker, start_date)
-            # 날짜 인덱스 보정
-            df.index = pd.to_datetime(df.index)
-            
-            if len(df) < 60: continue
-            
-            df = calculate_indicators(df)
-            curr = df.iloc[-1]
-            prev = df.iloc[-2]
-            name = name_map.get(ticker, ticker)
-            
-            # Signals
-            ma_sig_text = ""
-            if prev['MA5'] <= prev['MA20'] and curr['MA5'] > curr['MA20']: ma_sig_text = "✅ Golden Cross"
-            elif prev['MA5'] >= prev['MA20'] and curr['MA5'] < curr['MA20']: ma_sig_text = "✅ Dead Cross"
-            elif curr['MA5'] > curr['MA20']: ma_sig_text = "Golden Zone"
-            elif curr['MA5'] < curr['MA20']: ma_sig_text = "Dead Zone"
-            
-            rsi_val = curr['RSI']
-            rsi_sig_text = ""
-            if rsi_val >= 60: rsi_sig_text = "✅ Overbought"
-            elif rsi_val <= 40: rsi_sig_text = "✅ Oversold"
-            
-            bb_pct = curr['PctB']
-            bb_sig_text = ""
-            if bb_pct >= 0.95: bb_sig_text = "✅ Near Upper"
-            elif bb_pct <= 0.05: bb_sig_text = "✅ Near Lower"
-
-            results.append({
-                'Ticker': ticker,
-                'Name': name,
-                'Close': curr['Close'],
-                'MA_Signal': ma_sig_text,
-                'MA_Gap': round(curr['MA_Gap'], 2),
-                'RSI_Signal': rsi_sig_text,
-                'RSI_Value': round(rsi_val, 2),
-                'BB_Signal': bb_sig_text,
-                'BB_PctB': round(bb_pct, 2),
-                'Data': df
-            })
-            
-        except: continue
-            
     progress_bar.empty()
     status_text.empty()
+    
     return pd.DataFrame(results)
 
 # -----------------------------------------------------------
-# 3. 차트 그리기 (Y축 자동 스케일링 적용)
+# 4. 차트 그리기 (Y축 최적화 유지)
 # -----------------------------------------------------------
 def plot_chart(row):
     df = row['Data'].copy()
     df.index = pd.to_datetime(df.index)
     
-    # 최근 120일 데이터만 사용
+    # 차트용 데이터 슬라이싱 (최근 120일)
     df = df.iloc[-120:]
     
-    # -----------------------------------------
-    # [핵심] Y축 범위 동적 계산 (Dynamic Scaling)
-    # -----------------------------------------
-    # 캔들(저가, 고가)와 볼린저밴드(상단, 하단) 중 가장 낮은 값과 높은 값을 찾음
+    # Y축 스케일링 계산
     min_candidates = [df['Low'].min(), df['BB_Lower'].min()]
     max_candidates = [df['High'].max(), df['BB_Upper'].max()]
     
-    # NaN 값 제외하고 최소/최대 찾기
     y_min = min([x for x in min_candidates if not np.isnan(x)])
     y_max = max([x for x in max_candidates if not np.isnan(x)])
-    
-    # 여백(Padding) 5% 추가 (차트 위아래가 답답하지 않게)
     padding = (y_max - y_min) * 0.05
     y_range = [y_min - padding, y_max + padding]
-    # -----------------------------------------
 
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
                         vertical_spacing=0.03, row_heights=[0.7, 0.3],
@@ -178,7 +193,7 @@ def plot_chart(row):
     fig.add_trace(go.Scatter(x=df.index, y=df['MA5'], line=dict(color='orange', width=1), name='MA5'), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df['MA20'], line=dict(color='blue', width=1), name='MA20'), row=1, col=1)
     
-    # BB (Red, No Fill)
+    # BB
     fig.add_trace(go.Scatter(x=df.index, y=df['BB_Upper'], line=dict(color='red', width=1), name='BB Up'), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df['BB_Lower'], line=dict(color='red', width=1), name='BB Low'), row=1, col=1)
 
@@ -193,27 +208,23 @@ def plot_chart(row):
     fig.add_hline(y=60, line_dash="dash", line_color="orange", row=2, col=1)
     fig.add_hline(y=40, line_dash="dash", line_color="navy", row=2, col=1)
 
-    # Layout Setting
+    # Layout
     min_date = df.index[0]
     max_date = df.index[-1]
 
     fig.update_layout(height=400, margin=dict(t=30, b=0, l=10, r=10), showlegend=False)
-    
-    # X축 고정 + Y축 범위 강제 적용
     fig.update_xaxes(range=[min_date, max_date], rangeslider_visible=False)
-    
-    # 여기서 계산해둔 y_range를 적용합니다.
     fig.update_layout(yaxis=dict(range=y_range)) 
     
     return fig
 
 # -----------------------------------------------------------
-# 4. 메인 UI
+# 5. 메인 UI
 # -----------------------------------------------------------
 def main():
     c1, c2 = st.columns([8,2])
-    c1.title("📊 ETF Pro : Smart Dashboard")
-    c1.caption("필터: 시총 200억↑ | 조건: **AND (교집합)** 적용 | **체크박스 선택 시 차트 자동 생성**")
+    c1.title("⚡ ETF Pro : High Speed")
+    c1.caption("필터: 시총 200억↑ | **병렬 처리(Multi-threading) 적용으로 속도 대폭 개선**")
     if c2.button("🔄 데이터 업데이트"):
         st.session_state['loaded'] = False
         st.rerun()
@@ -221,16 +232,17 @@ def main():
     if 'loaded' not in st.session_state: st.session_state['loaded'] = False
     
     if not st.session_state['loaded']:
-        with st.spinner("시장 데이터 스캔 중..."):
+        with st.spinner("데이터 고속 수집 중..."):
             tickers = get_etf_list()
-            df_res = analyze_data(tickers)
+            # 병렬 처리 함수 호출
+            df_res = analyze_data_parallel(tickers)
             st.session_state['df_res'] = df_res
             st.session_state['loaded'] = True
     
     if st.session_state['loaded']:
         df = st.session_state['df_res']
         if df.empty:
-            st.error("데이터 없음")
+            st.error("데이터 없음 (네트워크 연결 확인)")
             return
 
         st.divider()
@@ -257,7 +269,7 @@ def main():
         filtered_df = df[mask].copy()
         
         # --- Table ---
-        st.success(f"검색된 ETF: **{len(filtered_df)}** 종목")
+        st.success(f"검색된 ETF: **{len(filtered_df)}** 종목 (총 {len(df)}개 중)")
         
         filtered_df.insert(0, "선택", False)
         
@@ -284,7 +296,7 @@ def main():
         
         if not selected_rows.empty:
             st.divider()
-            st.markdown(f"### 📈 차트 모아보기 ({len(selected_rows)}개)")
+            st.markdown(f"### 📈 차트 ({len(selected_rows)}개)")
             
             cols = st.columns(2)
             
@@ -297,7 +309,7 @@ def main():
                     with cols[idx % 2]:
                         st.plotly_chart(chart_fig, use_container_width=True)
         else:
-            st.info("👆 목록 왼쪽의 체크박스를 클릭하면 차트가 표시됩니다.")
+            st.info("👆 표의 체크박스를 누르면 차트가 표시됩니다.")
 
 if __name__ == "__main__":
     main()
