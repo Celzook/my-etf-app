@@ -1,7 +1,9 @@
-streamlit
-finance-datareader
-pandas
+setuptools
+pykrx==1.0.45
+pandas>=1.5,<3.0
 numpy
+openpyxl
+tqdm
+yfinance
+streamlit
 plotly
-lxml
-beautifulsoup4
